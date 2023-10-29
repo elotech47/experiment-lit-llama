@@ -23,9 +23,14 @@ from lit_llama.model import LLaMA, LLaMAConfig
 from lit_llama.tokenizer import Tokenizer
 from scripts.prepare_alpaca import generate_prompt
 
+import neptune
+
+# Initialize Neptune
+run = neptune.init_run(project='elo/dmo-llm', api_token=os.environ['NEPTUNE_API_TOKEN'])
+
 
 instruction_tuning = True
-eval_interval = 100
+eval_interval = 50
 save_interval = 100
 eval_iters = 100
 log_interval = 1
@@ -36,7 +41,7 @@ batch_size = 128
 micro_batch_size = 4
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
-max_iters = 50000 * 3 // micro_batch_size
+max_iters = 20000 * 3 // micro_batch_size
 weight_decay = 0.0
 max_seq_length = 256  # see scripts/prepare_alpaca.py
 lora_r = 8
@@ -44,6 +49,19 @@ lora_alpha = 16
 lora_dropout = 0.05
 warmup_iters = 100
 
+run['parameters'] = {
+    'learning_rate': learning_rate,
+    'batch_size': batch_size,
+    'micro_batch_size': micro_batch_size,
+    'gradient_accumulation_iters': gradient_accumulation_iters,
+    'max_iters': max_iters,
+    'weight_decay': weight_decay,
+    'max_seq_length': max_seq_length,
+    'lora_r': lora_r,
+    'lora_alpha': lora_alpha,
+    'lora_dropout': lora_dropout,
+    'warmup_iters': warmup_iters
+}
 
 def main(
     data_dir: str = "data/alpaca", 
@@ -75,7 +93,7 @@ def main(
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     model, optimizer = fabric.setup(model, optimizer)
-    train(fabric, model, optimizer, train_data, val_data, tokenizer_path, out_dir)
+    train(fabric, model, optimizer, train_data, val_data, tokenizer_path, out_dir, neptune_run=run)
 
     # Save the final LoRA checkpoint at the end of training
     checkpoint = lora_state_dict(model)
@@ -90,6 +108,7 @@ def train(
     val_data: np.ndarray,
     tokenizer_path: str,
     out_dir: str,
+    neptune_run: run,
 ) -> None:
     """The training loop.
 
@@ -104,6 +123,7 @@ def train(
             lr = learning_rate * step_count / warmup_iters
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
+                run['lr'].log(lr)
 
         t0 = time.time()
 
@@ -111,15 +131,17 @@ def train(
         with fabric.no_backward_sync(model, enabled=((iter_num + 1) % gradient_accumulation_iters != 0)):
             logits = model(input_ids)
             loss = loss_fn(logits, targets)
+            run['train_loss'].log(loss.item())
             fabric.backward(loss / gradient_accumulation_iters)
 
-        if (iter_num + 1) % gradient_accumulation_iters == 0:
+        if (iter_num + 1) % gradient_accumulation_iters == 0 or iter_num == 0:
             optimizer.step()
             optimizer.zero_grad()
             step_count += 1
                 
-            if step_count % eval_interval == 0:
-                val_loss = validate(fabric, model, val_data, tokenizer_path)
+            if step_count % eval_interval == 0 or iter_num == 0:
+                val_loss = validate(fabric, model, val_data, tokenizer_path, run=run, iter=iter_num)
+                run['val_loss'].log(val_loss)
                 fabric.print(f"step {iter_num}: val loss {val_loss:.4f}")
                 fabric.barrier()
 
@@ -129,10 +151,12 @@ def train(
                 # TODO: Provide a function/script to merge the LoRA weights with pretrained weights
                 checkpoint = lora_state_dict(model)
                 fabric.save(os.path.join(out_dir, f"iter-{iter_num:06d}-ckpt.pth"), checkpoint)
+                run["model_checkpoint"].upload(os.path.join(out_dir, f"iter-{iter_num:06d}-ckpt.pth"))
 
         dt = time.time() - t0
         if iter_num % log_interval == 0:
             fabric.print(f"iter {iter_num}: loss {loss.item():.4f}, time: {dt*1000:.2f}ms")
+            run['train_time'].log(dt*1000)
 
 
 def generate_response(model, instruction, tokenizer_path):
@@ -154,7 +178,7 @@ def generate_response(model, instruction, tokenizer_path):
 
 
 @torch.no_grad()
-def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: np.ndarray, tokenizer_path: str) -> torch.Tensor:
+def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: np.ndarray, tokenizer_path: str, run=run, iter=0) -> torch.Tensor:
     fabric.print("Validating ...")
     model.eval()
     losses = torch.zeros(eval_iters)
@@ -166,11 +190,17 @@ def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: np.ndarray, tok
     out = losses.mean()
 
     # produce an example:
-    instruction = "Recommend a movie for me to watch during the weekend and explain the reason."
-    
+    instructions = ["How can one be saved?", "When will the world end?", "What is the meaning of life?", 
+                    "Why did Jesus die?", "What is the gospel?", "What is the Trinity?", "What is the Bible?",
+                    "What is the kingdom of God?", "Can one resurrect from the dead?", "Is it a sin to kill?"]
+
+    instruction = np.random.choice(instructions)    
     output = generate_response(model, instruction, tokenizer_path)
     fabric.print(instruction)
     fabric.print(output)
+    
+    run[f"instruction/text_iter{iter}"] = instruction
+    run[f"response/text/{iter}"] = output
 
     model.train()
     return out.item()
